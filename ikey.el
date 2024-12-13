@@ -3,7 +3,7 @@
 ;; Copyright (C) 2024 Laluxx
 
 ;; Author: Laluxx
-;; Version: 3.1.0
+;; Version: 3.2.0
 ;; Package-Requires: ((emacs "25.1"))
 ;; Keywords: convenience, help
 ;; URL: https://github.com/laluxx/ikey
@@ -44,8 +44,8 @@
 (defvar ikey--actions
   '((?i . ("insert" . ikey--insert))
     (?d . ("describe" . describe-function))
-    (?g . ("goto definition" . find-function))
-    (?s . ("view source" . find-function-other-window)))
+    (?g . ("goto definition" . ikey--goto-definition))
+    (?s . ("view source" . ikey--view-source)))
   "Mapping of keys to actions and their descriptions.")
 
 (defun ikey--format-key-modifiers (key)
@@ -109,8 +109,26 @@ If FOR-INSERTION is non-nil, format for insertion rather than display."
         (ikey--format-lambda-for-insertion fn)
       (ikey--format-lambda-for-display fn)))
    ((symbolp fn)
-    (propertize (symbol-name fn) 'face 'font-lock-function-name-face))
+    (if for-insertion
+        (symbol-name fn)
+      (propertize (symbol-name fn) 'face 'font-lock-function-name-face)))
    (t (format "%s" fn))))
+
+(defun ikey--goto-definition (fn)
+  "Go to the definition of FN, with special handling for lambdas."
+  (if (and (functionp fn) (not (symbolp fn)))
+      (message "Cannot navigate to anonymous lambda definition")
+    (condition-case nil
+        (find-function fn)
+      (error (message "Cannot find function definition")))))
+
+(defun ikey--view-source (fn)
+  "View source of FN in another window."
+  (if (and (functionp fn) (not (symbolp fn)))
+      (message "Cannot view source of anonymous lambda definition")
+    (condition-case nil
+        (find-function-other-window fn)
+      (error (message "Cannot find function source")))))
 
 (defun ikey--truncate-message (message)
   "Truncate MESSAGE to fit in the minibuffer."
@@ -135,7 +153,8 @@ If FOR-INSERTION is non-nil, format for insertion rather than display."
                     ":"
                     (propertize desc 'face 'font-lock-function-name-face))))
                ikey--actions "  ")
-            (concat (propertize (mapconcat #'char-to-string actions "") 'face 'font-lock-constant-face)))))
+            (concat (propertize (mapconcat #'char-to-string actions "") 
+                                'face 'font-lock-constant-face)))))
     (concat " [" action-string "] " help-key)))
 
 (defun ikey--insert (fn)
@@ -168,7 +187,9 @@ If FOR-INSERTION is non-nil, format for insertion rather than display."
         (ikey-describe-key key))
        ((alist-get action ikey--actions)
         (funcall (cdr (alist-get action ikey--actions)) function))
-       (t (message "Invalid action"))))))
+       (t 
+        ;; Fall through - execute the original key binding
+        (setq unread-command-events (list (cons t action))))))))
 
 ;;;###autoload
 (define-minor-mode ikey-mode
