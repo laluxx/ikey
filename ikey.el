@@ -3,23 +3,25 @@
 ;; Copyright (C) 2024 Laluxx
 
 ;; Author: Laluxx
-;; Version: 1.0.0
+;; Version: 3.1.0
 ;; Package-Requires: ((emacs "25.1"))
 ;; Keywords: convenience, help
 ;; URL: https://github.com/laluxx/ikey
 
 ;;; Commentary:
 
-;; Enhanced key description interface with documentation and insertion functionality.
-;; It shows formatted key bindings in the minibuffer and can insert function names at point.
-;; - Customize `ikey-always-insert' to control insertion behavior
+;; [x] DONE Remember the last state of ?
+;; [ ] TODO Simple theme options (do it in `ilib' so every "iprogram" obey)
+;; [ ] TODO Fall back on `help' if `helpful' is not installed
+;; [ ] TODO Apropos integretion
+;; [ ] TODO Make the `ilib' package to make programs
+;;     with a similar interface to this one
 
-;; TODO Handle lambdas better remove and add whitespaces where needed
-;; (λ   (  if (use-region-p) (call-interactively (quote laluxx/generate-face-colors)) (insert "j")  ) )
+;; Enhanced key description interface with documentation and insertion functionality.
+;; Shows formatted key bindings in the minibuffer and can insert function names at point.
+;; Handles lambda functions gracefully both in display and insertion.
 
 ;;; Code:
-
-(require 'rainbow-delimiters nil t)
 
 (defgroup ikey nil
   "Enhanced key description with function name insertion."
@@ -31,69 +33,20 @@
   :type 'boolean
   :group 'ikey)
 
-(defvar ikey--last-described-key nil
-  "Store the last key described.")
+(defcustom ikey-max-minibuffer-width 120
+  "Maximum width for ikey messages in the minibuffer."
+  :type 'integer
+  :group 'ikey)
 
-(defvar ikey--last-described-function nil
-  "Store the last function described.")
+(defvar ikey--help-active nil
+  "Whether the help view is currently active.")
 
-(defun ikey--format-namespace (name)
-  "Format namespace part of NAME with proper face."
-  (let ((parts (split-string name "/")))
-    (if (= (length parts) 2)
-        (concat
-         (propertize (car parts) 'face 'default)
-         (propertize "/" 'face 'default)
-         (propertize (cadr parts) 'face 'font-lock-function-name-face))
-      (propertize name 'face 'font-lock-function-name-face))))
-
-(defun ikey--format-string (str)
-  "Format STR as a string with proper face."
-  (propertize (format "\"%s\"" str) 'face 'font-lock-string-face))
-
-(defun ikey--format-symbol (sym)
-  "Format SYM with proper face based on type."
-  (let ((name (symbol-name sym)))
-    (cond
-     ((string= name "nil") (propertize name 'face 'font-lock-comment-face))
-     ((string= name "if") (propertize name 'face 'font-lock-keyword-face))
-     ((string= name "interactive") (propertize name 'face 'font-lock-keyword-face))
-     ((string-match-p "/" name) (ikey--format-namespace name))
-     (t (propertize name 'face 'font-lock-function-name-face)))))
-
-(defun ikey--format-sexp (sexp indent)
-  "Format SEXP with proper faces and INDENT level."
-  (cond
-   ((stringp sexp) (ikey--format-string sexp))
-   ((symbolp sexp) (ikey--format-symbol sexp))
-   ((listp sexp)
-    (let ((op (propertize "(" 'face 'rainbow-delimiters-depth-2-face))
-          (cp (propertize ")" 'face 'rainbow-delimiters-depth-2-face)))
-      (if (null sexp)
-          (propertize "nil" 'face 'font-lock-comment-face)
-        (let* ((items (mapcar (lambda (item) (ikey--format-sexp item (+ indent 2))) sexp))
-               (items-str (string-join items " ")))
-          (if (< (length items-str) 60)
-              (concat op items-str cp)
-            (concat op "\n"
-                    (make-string (1+ indent) ? ) items-str "\n"
-                    (make-string indent ? ) cp))))))
-   (t (format "%s" sexp))))
-
-(defun ikey--format-lambda (fn)
-  "Format lambda function FN with proper syntax highlighting."
-  (let ((lambda-str (prin1-to-string fn)))
-    (when (string-match "#\\[nil \\((.*)\\)" lambda-str)
-      (let* ((body-str (match-string 1 lambda-str))
-             (body-sexp (read body-str))
-             ;; Delete all newlines and extra spaces
-             (formatted-body (replace-regexp-in-string
-                              "[\n\r]\\|[[:blank:]]+" " "
-                              (substring (ikey--format-sexp body-sexp 0) 1))))
-        (concat
-         (propertize "(" 'face 'rainbow-delimiters-depth-2-face)
-         (propertize "λ" 'face 'font-lock-keyword-face) " "
-         formatted-body)))))
+(defvar ikey--actions
+  '((?i . ("insert" . ikey--insert))
+    (?d . ("describe" . describe-function))
+    (?g . ("goto definition" . find-function))
+    (?s . ("view source" . find-function-other-window)))
+  "Mapping of keys to actions and their descriptions.")
 
 (defun ikey--format-key-modifiers (key)
   "Format KEY with bold modifiers (C, M, S)."
@@ -110,47 +63,112 @@
     (propertize formatted-key 'face 'font-lock-constant-face)))
 
 (defun ikey--format-arrow ()
-  "Return a beautifully formatted arrow."
+  "Return a formatted arrow."
   (propertize " ⟶ " 'face '(:inherit font-lock-comment-face :weight bold)))
 
-(defun ikey--format-function-name (fn)
-  "Format function name FN with appropriate face and decoration."
+(defun ikey--parse-lambda-body (lambda-str)
+  "Parse the lambda function body from LAMBDA-STR."
+  (with-temp-buffer
+    (insert lambda-str)
+    (goto-char (point-min))
+    (when (re-search-forward "#\\[nil \\((.*?)\\)" nil t)
+      (let ((body (match-string 1)))
+        (condition-case nil
+            (read (current-buffer))
+          (error body))))))
+
+(defun ikey--format-lambda-for-display (fn)
+  "Format lambda function FN for display in minibuffer."
+  (let* ((lambda-str (prin1-to-string fn))
+         (body (ikey--parse-lambda-body lambda-str)))
+    (when body
+      (let ((formatted-str
+             (format "(λ %s)"
+                     (replace-regexp-in-string
+                      "\\s-+" " "
+                      (prin1-to-string body)))))
+        (propertize formatted-str 'face 'font-lock-function-name-face)))))
+
+(defun ikey--format-lambda-for-insertion (fn)
+  "Format lambda function FN for insertion at point."
+  (let* ((lambda-str (prin1-to-string fn))
+         (body (ikey--parse-lambda-body lambda-str)))
+    (if body
+        (format "(lambda () (interactive) %s)"
+                (replace-regexp-in-string
+                 "\\s-+" " "
+                 (prin1-to-string body)))
+      lambda-str)))
+
+(defun ikey--format-function-name (fn &optional for-insertion)
+  "Format function name FN with appropriate face.
+If FOR-INSERTION is non-nil, format for insertion rather than display."
   (cond
-   ((and (functionp fn) (string-match-p "^#\\[" (prin1-to-string fn)))
-    (ikey--format-lambda fn))
+   ((and (functionp fn) (not (symbolp fn)))
+    (if for-insertion
+        (ikey--format-lambda-for-insertion fn)
+      (ikey--format-lambda-for-display fn)))
    ((symbolp fn)
-    (let ((open-paren (propertize "(" 'face 'rainbow-delimiters-depth-2-face))
-          (close-paren (propertize ")" 'face 'rainbow-delimiters-depth-2-face)))
-      (concat open-paren (ikey--format-symbol fn) close-paren)))
+    (propertize (symbol-name fn) 'face 'font-lock-function-name-face))
    (t (format "%s" fn))))
+
+(defun ikey--truncate-message (message)
+  "Truncate MESSAGE to fit in the minibuffer."
+  (if (> (length message) ikey-max-minibuffer-width)
+      (concat (substring message 0 (- ikey-max-minibuffer-width 3)) "...")
+    message))
+
+(defun ikey--format-action-prompt ()
+  "Format the action prompt based on the current help view state."
+  (let* ((actions (mapcar #'car ikey--actions))
+         (help-key (propertize "?" 'face (if ikey--help-active
+                                             'font-lock-keyword-face
+                                           'font-lock-comment-face)))
+         (action-string
+          (if ikey--help-active
+              (mapconcat
+               (lambda (action)
+                 (let ((key (car action))
+                       (desc (cadr action)))
+                   (concat
+                    (propertize (char-to-string key) 'face 'font-lock-constant-face)
+                    ":"
+                    (propertize desc 'face 'font-lock-function-name-face))))
+               ikey--actions "  ")
+            (concat (propertize (mapconcat #'char-to-string actions "") 'face 'font-lock-constant-face)))))
+    (concat " [" action-string "] " help-key)))
+
+(defun ikey--insert (fn)
+  "Insert function FN at point with proper formatting."
+  (insert (ikey--format-function-name fn t)))
+
+(defun ikey--toggle-help ()
+  "Toggle the expanded help view."
+  (setq ikey--help-active (not ikey--help-active)))
 
 ;;;###autoload
 (defun ikey-describe-key (key)
-  "Show enhanced description of key binding.
-If `ikey-always-insert' is non-nil, always insert the function name.
-Otherwise, show description first and insert on second press of the same key."
+  "Show enhanced description of key binding."
   (interactive "kPress key: ")
   (let* ((function (key-binding key))
          (message-log-max nil)
-         (current-key-sequence (key-description key)))
-    (if (or ikey-always-insert
-            (and (equal current-key-sequence ikey--last-described-key)
-                 ikey--last-described-function))
-        (progn
-          (if (and (functionp function) (string-match-p "^#\\[" (prin1-to-string function)))
-              (insert (ikey--format-lambda function))
-            (if (symbolp function)
-                (insert (symbol-name function))
-              (insert (prin1-to-string function))))
-          (setq ikey--last-described-key nil
-                ikey--last-described-function nil))
-      (progn
-        (message "%s%s%s"
-                 (ikey--format-key-description current-key-sequence)
-                 (ikey--format-arrow)
-                 (ikey--format-function-name function))
-        (setq ikey--last-described-key current-key-sequence
-              ikey--last-described-function function)))))
+         (current-key-sequence (key-description key))
+         (key-desc (ikey--format-key-description current-key-sequence))
+         (fn-desc (ikey--format-function-name function))
+         (arrow (ikey--format-arrow))
+         (prompt (ikey--format-action-prompt))
+         (message (concat key-desc arrow fn-desc prompt)))
+    
+    (message "%s" (ikey--truncate-message message))
+    
+    (let ((action (read-char-exclusive)))
+      (cond
+       ((eq action ??)
+        (ikey--toggle-help)
+        (ikey-describe-key key))
+       ((alist-get action ikey--actions)
+        (funcall (cdr (alist-get action ikey--actions)) function))
+       (t (message "Invalid action"))))))
 
 ;;;###autoload
 (define-minor-mode ikey-mode
